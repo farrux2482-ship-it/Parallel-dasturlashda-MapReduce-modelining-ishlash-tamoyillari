@@ -1,0 +1,77 @@
+import re, time, random
+from collections import Counter, defaultdict
+from multiprocessing import Pool, cpu_count
+
+WORD_RE = re.compile(r"[a-zA-Z0-9']+")   # so‘zni ajratish andozasi
+
+def generate_corpus(n_words, vocab_size=5000, seed=42):
+    """Zipf taqsimotiga yaqin sun’iy matn (qatorlar ro‘yxati)."""
+    rnd = random.Random(seed)
+    vocab = ["w%d" % i for i in range(vocab_size)]
+    weights = [1.0 / (i + 1) for i in range(vocab_size)]
+    words = rnd.choices(vocab, weights=weights, k=n_words)
+    return [" ".join(words[i:i + 12]) for i in range(0, n_words, 12)]
+
+# ---------- MAP (+ COMBINER) ----------
+def map_func(chunk):
+    """Bo‘lakdagi har bir so‘z uchun emit(so‘z, 1) va lokal jamlash."""
+    local = Counter()                 # combiner: tarmoqqa chiqishdan oldin jamlash
+    for line in chunk:
+        for w in WORD_RE.findall(line.lower()):
+            local[w] += 1
+    return list(local.items())        # [(so‘z, qisman_son), ...]
+
+# ---------- PARTITION + SHUFFLE ----------
+def shuffle(mapped_lists, R):
+    """Kalit bo‘yicha guruhlash: reducer raqami = hash(kalit) mod R."""
+    parts = [defaultdict(list) for _ in range(R)]
+    for pairs in mapped_lists:
+        for k, v in pairs:
+            parts[hash(k) % R][k].append(v)
+    return parts
+
+# ---------- REDUCE ----------
+def reduce_func(part):
+    """(kalit, [qiymatlar]) -> (kalit, yig‘indi)."""
+    return [(k, sum(vs)) for k, vs in part.items()]
+
+# ---------- Ketma-ket variant (taqqoslash uchun) ----------
+def wordcount_serial(lines):
+    c = Counter()
+    for line in lines:
+        c.update(WORD_RE.findall(line.lower()))
+    return c
+
+# ---------- Parallel MapReduce ----------
+def split(lines, M):
+    size = (len(lines) + M - 1) // M
+    return [lines[i:i + size] for i in range(0, len(lines), size)]
+
+def wordcount_mapreduce(lines, workers):
+    with Pool(workers) as pool:
+        chunks = split(lines, workers * 4)         # 1) Split
+        mapped = pool.map(map_func, chunks)        # 2) Map (parallel)
+        parts = shuffle(mapped, workers)           # 3) Partition + Shuffle
+        reduced = pool.map(reduce_func, parts)     # 4) Reduce (parallel)
+    result = {}
+    for r in reduced:
+        result.update(r)                           # 5) Natijalarni birlashtirish
+    return result
+
+def timeit(f, *a, repeat=3):
+    best = 1e9
+    for _ in range(repeat):                         # eng yaxshi vaqt olinadi
+        t = time.perf_counter(); out = f(*a)
+        best = min(best, time.perf_counter() - t)
+    return best, out
+
+if __name__ == "__main__":
+    N = 5_000_000
+    lines = generate_corpus(N)
+    t1, ref = timeit(wordcount_serial, lines)
+    print(f"Ketma-ket: {t1:.3f} s")
+    for p in [1, 2, 4, 8]:
+        if p > cpu_count(): break
+        tp, res = timeit(wordcount_mapreduce, lines, p)
+        assert dict(ref) == res, "Natijalar mos kelmadi!"
+        print(p, f"{tp:.3f}", f"S={t1/tp:.2f}", f"E={t1/tp/p:.2f}")
